@@ -1,23 +1,24 @@
-
-import React from 'react';
-import {
-  StyleSheet,
-
-  View,
-
-  Platform,
-} from 'react-native';
-import {WebView} from 'react-native-webview';
+import React, {
+  useRef,
+  useEffect,
+  forwardRef,
+  useImperativeHandle,
+} from "react";
+import { StyleSheet, View, Platform } from "react-native";
+import { WebView } from "react-native-webview";
 
 const listenerType = () => {
   switch (Platform.OS) {
-    case 'android':
-      return 'document';
-    case 'ios':
-      return 'window';
+    case "android":
+      return "document";
+    case "ios":
+      return "window";
   }
 };
-const sourceHtml = `
+const buildSourceHtml = (
+  backgroundColor = "rgba(0,0,0,0)",
+  penColor = "black"
+) => `
 
 <!DOCTYPE html>
 <html lang="en">
@@ -339,42 +340,59 @@ const sourceHtml = `
 
     const signaturePad = new SignaturePad(canvas,{
         onEnd: () => {
-            const data = signaturePad.toDataURL('image/png');
             const payload = JSON.stringify({
-                type: 'SAVE_SIGNATURE',
-                dataURI: data
+                type: 'ON_END'
             })
             window.ReactNativeWebView.postMessage(payload)
         },
-        backgroundColor: 'rgb(255,255,255)',
+        backgroundColor: '${backgroundColor}',
+        penColor: '${penColor}'
     });
     
     ${listenerType()}.addEventListener("message", (event) => {
+        const { id, action, data, options } = JSON.parse(event.data);
         
-        switch (event.data) {
-            case 'SAVE_SIGNATURE':
-                const data = signaturePad.toDataURL('image/png');
-                const payload = JSON.stringify({
-                    type: 'SAVE_SIGNATURE',
-                    dataURI: data
-                })
-               
-                window.ReactNativeWebView.postMessage(payload)
+        switch (action) {
+            case 'FROM_DATA': {
+                signaturePad.fromData(data, options ?? {})
                 break;
-
-            case 'IS_SIGNATURE_EMPTY':
-                const payload_two = JSON.stringify({
-                    type: 'IS_SIGNATURE_EMPTY',
-                    isEmpty: signaturePad.isEmpty()
-                })
-                window.ReactNativeWebView.postMessage(payload_two)
+            }
+            case 'TO_DATA': {    
+                window.ReactNativeWebView.postMessage(JSON.stringify({
+                    id,
+                    type: 'ACTION_RESPONSE',
+                    responseData: signaturePad.toData()
+                }))
                 break;
-
-            case 'CLEAR_SIGNATURE':
-               
+            }
+            case 'TO_DATA_URL': {  
+                window.ReactNativeWebView.postMessage(JSON.stringify({
+                    id,
+                    type: 'ACTION_RESPONSE',
+                    responseData: signaturePad.toDataURL(options ?? 'image/png')
+                }))
+                break;
+            }
+            case 'IS_SIGNATURE_EMPTY': {
+                window.ReactNativeWebView.postMessage(JSON.stringify({
+                    id, 
+                    type: 'ACTION_RESPONSE',
+                    responseData: signaturePad.isEmpty()
+                }))
+                break;
+            }
+            case 'ON': {
+                signaturePad.on();
+                break;
+            }
+            case 'OFF': {
+                signaturePad.off();
+                break;
+            }
+            case 'CLEAR_SIGNATURE': {
                 signaturePad.clear();
-               
                 break;
+            }
         }
     });
 </script>
@@ -385,65 +403,152 @@ const styles = StyleSheet.create({
   root: {
     height: 200,
   },
+  webView: { width: "100%", height: "100%" },
 });
 
-export class SignatureView extends React.PureComponent {
-  constructor({onSave, onClear}) {
-    super();
-    this.webViewRef = React.createRef(null);
-    this.state = {
-      onSave: onSave,
-      onClear: onClear,
+function Deferred() {
+  let resolve = null;
+  let reject = null;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+export const SignatureView = forwardRef(
+  (
+    {
+      onSave,
+      onEnd: userDefinedOnEnd,
+      onLoad = () => {},
+      style,
+      webviewStyle,
+      backgroundColor = "rgba(0,0,0,0)",
+      penColor = "black",
+      ...rest
+    },
+    ref
+  ) => {
+    const webViewRef = useRef(null);
+    const messageQueue = useRef([]);
+    const lastMessageId = useRef(0);
+
+    const postMessage = (action, data, options, id) => {
+      webViewRef.current.postMessage(
+        JSON.stringify({
+          action,
+          data,
+          options,
+          id,
+        })
+      );
     };
-  }
 
-  saveSignature = () => {
-    this.webViewRef.current.postMessage('SAVE_SIGNATURE');
-  };
+    const queueMessage = (action, data, options) => {
+      const newId = ++lastMessageId.current;
+      const responseDeferred = Deferred();
+      postMessage(action, data, options, newId);
+      messageQueue.current.push({ id: newId, deferred: responseDeferred });
+      return responseDeferred.promise;
+    };
 
-  clearSignature = () => {
-    this.webViewRef.current.postMessage('CLEAR_SIGNATURE');
-    this.state.onClear?.();
-  };
+    const resolveQueuedMessage = (id, data) => {
+      const message = messageQueue.current.find((x) => x.id === id);
+      if (message) {
+        message.deferred.resolve(data);
+        messageQueue.current = messageQueue.current.filter((x) => x.id !== id);
+      }
+    };
 
-  isEmpty = () => {
-    this.webViewRef.current.postMessage('IS_SIGNATURE_EMPTY');
-  };
+    const fromData = (data, options) => {
+      postMessage("FROM_DATA", data, options);
+    };
 
-  onMessage = (event) => {
-    const parsedData = JSON.parse(event.nativeEvent.data);
+    const toData = async () => {
+      return queueMessage("TO_DATA");
+    };
 
-    switch (parsedData.type) {
-      case 'IS_SIGNATURE_EMPTY':
-        // console.log('IS_SIGNATURE_EMPTY', parsedData.isEmpty);
+    const toDataURL = async (options) => {
+      return queueMessage("TO_DATA_URL", undefined, options);
+    };
 
-        break;
-      case 'SAVE_SIGNATURE':
-        // console.log('SAVE_SIGNATURE', parsedData.dataURI);
-        this.state.onSave?.(parsedData.dataURI);
-        break;
-    }
-  };
+    const clearSignature = () => {
+      postMessage("CLEAR_SIGNATURE");
+    };
 
-  render() {
+    const isEmpty = async () => {
+      return queueMessage("IS_SIGNATURE_EMPTY");
+    };
+
+    const on = () => {
+      postMessage("ON");
+    };
+
+    const off = () => {
+      postMessage("OFF");
+    };
+
+    const onEnd = () => {
+      userDefinedOnEnd?.();
+      if (onSave) {
+        saveSignature();
+      }
+    };
+
+    const saveSignature = async () => {
+      const dataUrl = await toDataURL();
+      const data = await toData();
+      onSave?.(dataUrl, data);
+    };
+
+    const onMessage = (event) => {
+      const parsedData = JSON.parse(event.nativeEvent.data);
+      switch (parsedData.type) {
+        case "ACTION_RESPONSE": {
+          resolveQueuedMessage(parsedData.id, parsedData.responseData);
+          break;
+        }
+        case "ON_END": {
+          onEnd();
+          break;
+        }
+      }
+    };
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        fromData,
+        toData,
+        toDataURL,
+        clearSignature,
+        isEmpty,
+        on,
+        off,
+        saveSignature,
+      }),
+      []
+    );
+
     return (
-      <View
-        style={StyleSheet.compose(styles.root, this.props.style)}
-        {...this.props}>
+      <View style={StyleSheet.compose(styles.root, style)} {...rest}>
         <WebView
-          style={{width: '100%', height: '100%'}}
-          ref={(ref) => (this.webViewRef.current = ref)}
-          onMessage={this.onMessage}
+          style={StyleSheet.compose(styles.webView, webviewStyle)}
+          ref={webViewRef}
+          onMessage={onMessage}
           javaScriptEnabled={true}
+          onLoad={onLoad}
           source={{
-            html: sourceHtml,
+            html: buildSourceHtml(backgroundColor, penColor),
             // uri:
             //   'https://stackoverflow.com/questions/37455701/react-native-nested-scrollview-cant-scroll-on-android-device',
           }}
           scrollEnabled={false}
           domStorageEnabled={true}
+          bounce={false}
         />
       </View>
     );
   }
-}
+);
